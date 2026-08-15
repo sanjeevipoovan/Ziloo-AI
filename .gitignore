@@ -1,48 +1,99 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-
-# Environment / secrets
+# ==========================================
+# Environment / Secrets
+# ==========================================
 .env
 .env.*
 !.env.example
 
-# Virtual environments
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# ==========================================
+# Python Virtual Environments
+# ==========================================
 .venv/
 venv/
 env/
 ENV/
 
-# Testing
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-
-# Type checking
-.mypy_cache/
-.pyright/
-
-# Build
+# ==========================================
+# Node.js / React / Vite
+# ==========================================
+node_modules/
 dist/
-build/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
+# ==========================================
+# Build / Packaging
+# ==========================================
+build/
+*.whl
+
+# ==========================================
 # Logs
+# ==========================================
 *.log
 
-# Local databases
+# ==========================================
+# Databases
+# ==========================================
 *.db
 *.sqlite
 *.sqlite3
 
-# IDE
+# ==========================================
+# IDE / Editors
+# ==========================================
 .vscode/
 .idea/
+*.swp
+*.swo
 
+# ==========================================
 # OS
+# ==========================================
 .DS_Store
 Thumbs.db
+Desktop.ini
 
+# ==========================================
 # Jupyter
+# ==========================================
 .ipynb_checkpoints/
+
+# ==========================================
+# Docker
+# ==========================================
+docker-compose.override.yml
+
+# ==========================================
+# Coverage / Test Reports
+# ==========================================
+coverage/
+htmlcov/
+.pytest_cache/
+
+# ==========================================
+# Temporary Files
+# ==========================================
+*.tmp
+*.temp
+*.bak
