@@ -1,103 +1,187 @@
-# Ziloo AI — frontend
+# MyAI Backend (V1)
 
-A React + TypeScript + Tailwind frontend for the MyAI backend (FastAPI +
-GLM-5.2/Kimi K3 routing). Vite-powered, no framework beyond React itself.
+A production-oriented modular monolith for a multi-model AI platform. FastAPI
+in front, Hugging Face-hosted GLM-5.2 and Kimi K3 behind a provider
+abstraction, PostgreSQL + pgvector for storage and RAG, Redis for rate
+limiting.
+
+```
+Client -> FastAPI -> Orchestrator -> Model Router -> Provider (Hugging Face) -> GLM-5.2 / Kimi K3
+                         |                                        |
+                         +-- Context Builder (prompt assembly)    +-- normalized into ProviderResponse
+                         v
+                    PostgreSQL / pgvector, Redis, Sentry
+```
+
+## Two design principles this build was built around
+
+**No hardcoding.** Nothing outside `app/providers/huggingface.py` knows
+Hugging Face exists, and even that file only knows whatever `model_identifier`
+and token it's handed at call time. The chain is:
+
+```
+LLMProvider (interface, app/providers/base.py)
+    -> HuggingFaceProvider (app/providers/huggingface.py)
+Model Registry (DB-backed, app/models/registry.py)
+    -> rows seeded from GLM_MODEL_ID / KIMI_MODEL_ID env vars (app/db/seed.py)
+Model Router (app/models/router.py)
+    -> deterministic auto-routing policy, independent of the API layer
+```
+
+Adding vLLM, OpenAI, Anthropic, or a future self-hosted MyAI model means
+writing one new class implementing `LLMProvider` and inserting a registry
+row - no changes to routing, orchestration, or API code. Swapping which HF
+model backs "glm-5.2" is an env var change, not a deploy.
+
+**Better prompting.** Every code path that talks to a model - a direct
+chat completion, an agent run, a RAG-grounded query - goes through
+`ContextBuilder` (`app/orchestrator/context.py`) to assemble the system
+prompt and message list. There's exactly one place that decides how a
+system prompt is built, how retrieved context is framed (with explicit
+citation instructions and an explicit "say so if you don't know"
+instruction), and how conversation history is threaded in - instead of
+each route hand-rolling prompt strings.
+
+## Important: this was built without network access
+
+I wrote this in a sandboxed environment with no network access, so I could
+not `pip install`, run Docker, connect to a real Postgres/Redis, or call
+Hugging Face. Concretely, that means:
+
+- **Verified:** every file's Python syntax (`py_compile`), the overall
+  import graph, and the logic by careful review. The Hugging Face client
+  usage (`AsyncInferenceClient.chat_completion`) was checked against
+  current documentation mid-build rather than assumed from memory.
+- **Not verified:** an actual `docker compose up`, a real `alembic upgrade
+head` against Postgres, a real `pytest` run, or a real call to GLM-5.2 /
+  Kimi K3. The initial migration (`migrations/versions/0001_initial.py`)
+  was hand-written to mirror the ORM models exactly, since generating it
+  with `alembic revision --autogenerate` requires a live database
+  connection I didn't have.
+
+**Recommended next step:** open this project in Claude Code (or your own
+terminal) where there's real network access, and run the Quickstart below.
+If anything doesn't come up cleanly, that's the fastest way to find and fix
+it - Claude Code can install dependencies, run the migration, run the
+tests, and iterate against real errors, which this sandbox couldn't do.
 
 ## Quickstart
 
 ```bash
-npm install
-npm run dev
+cp .env.example .env
+# edit .env: set JWT_SECRET, HF_API_TOKEN, and confirm GLM_MODEL_ID / KIMI_MODEL_ID
+
+docker compose up --build
 ```
 
-Opens on `http://localhost:5173`. By default it talks to a backend at
-`http://localhost:8000` — change this by opening the browser console and running:
+This builds the API image, starts Postgres (with pgvector) and Redis, runs
+`alembic upgrade head` automatically, then starts the API on
+`http://localhost:8000`. Interactive docs at `/docs`.
 
-```js
-localStorage.setItem("ziloo:apiBaseUrl", "https://your-cloud-run-url")
+```bash
+# 1. Register + log in
+curl -X POST localhost:8000/v1/auth/register -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"supersecret123"}'
+TOKEN=$(curl -s -X POST localhost:8000/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"supersecret123"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# 2. Create a project
+PROJECT_ID=$(curl -s -X POST localhost:8000/v1/projects -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"My Project"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 3. Create an API key (shown once - save it)
+curl -X POST localhost:8000/v1/projects/$PROJECT_ID/api-keys -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"local-dev"}'
+
+# 4. Chat, with auto routing
+curl -X POST localhost:8000/v1/chat/completions -H "X-API-Key: $MYAI_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Explain RAG in one paragraph"}]}'
 ```
 
-(See `src/lib/api.ts` — the base URL is read from `localStorage` rather than
-baked in at build time, so the same build works against local Docker or a
-deployed Cloud Run backend without a rebuild.)
+## Configuration
 
-## Design decisions
+All settings live in `app/core/config.py` and are read from `.env` /
+environment variables (see `.env.example` for the full list with
+descriptions). Nothing here is optional except where a default is shown -
+`DATABASE_URL`, `JWT_SECRET`, `HF_API_TOKEN`, `GLM_MODEL_ID`, and
+`KIMI_MODEL_ID` are required and the app will refuse to start without them.
 
-**Colors and type.** Same dual-accent system as the plain-JS version this
-replaced: teal for GLM-5.2, amber for Kimi K3, on a dark charcoal base.
-Space Grotesk for display text, IBM Plex Sans for body, IBM Plex Mono for
-anything code/ID-shaped. All defined in `tailwind.config.ts`.
+## Auth model
 
-**The signature idea carries through the redesign.** The one deliberate,
-non-decorative element is still that every assistant message shows *which
-model answered it*, via a colored left border and a badge
-(`src/components/chat/MessageBubble.tsx`, `src/components/ui/Badge.tsx`).
-Auto-routing is normally invisible infrastructure; here it's legible.
+Two mechanisms, resolved to one `Principal` (`app/api/dependencies.py`):
 
-## On the pasted "effects"
+- **Human users** — JWT bearer token from `/v1/auth/login`. Used for
+  dashboard-style access (creating projects, agents, API keys). A JWT isn't
+  scoped to a project, so project-scoped endpoints require `project_id`
+  explicitly and verify ownership on every call.
+- **External applications** — a MyAI API key (`X-API-Key` header, prefix
+  `myai_`). Scoped to exactly one project at creation time; every request
+  is pinned to that project regardless of what's in the request body.
 
-Three things were referenced that I want to be upfront about, rather than
-quietly pretending to have matched:
+Every project-scoped resource (agents, conversations, knowledge bases, API
+keys) is reachable only through `require_project_access` /
+`get_resolved_project_id` - see `tests/security/` for the IDOR tests this
+is meant to satisfy.
 
-- **`glimm`** (the rainbow-shader library in the prompt-bar example) isn't
-  something I could verify as an installable package, so there's no shader
-  sweep here.
-- **`SpecularButton`** and **`ParticleText`** were given only as usage
-  examples — prop lists, no implementation. I didn't have their source, so
-  I didn't attempt to clone them.
+## Testing
 
-What's actually in this build, rebuilt from scratch in plain CSS/React so
-it compiles and runs rather than referencing the unknown:
+```bash
+pip install -r requirements.txt
+pytest
+```
 
-- **Shimmer loading text** and a **live elapsed timer** (`ShimmerText.tsx`)
-  — the same instinct as the referenced "LoadingState" component.
-- An **expandable routing trace** (`RoutingTrace.tsx`) — the same instinct
-  as the referenced "ThinkingState" component, but wired to this app's
-  *real* SSE events (`model_selected`, `retrieval_started`,
-  `retrieval_completed`) instead of scripted demo content. What you see
-  expand is genuinely what the backend's router and retriever just did.
-- A **shine-on-hover button** (`Button.tsx`, `variant="shine"`) — a CSS
-  gradient sweep on a pseudo-layer, no canvas/WebGL, used on the chat send
-  button.
+Most of the suite runs against an in-memory SQLite database
+(`tests/conftest.py`) with the Hugging Face provider replaced by
+`tests/fakes.py::FakeProvider` (or `FailingProvider`, for the
+provider-failure test) - no network needed. One deliberate exception:
+**`document_chunks` uses pgvector's `Vector` column type, which has no
+SQLite equivalent**, so RAG/vector-search is excluded from the SQLite
+fixture and covered instead by `tests/integration/test_rag.py`, gated
+behind a real Postgres instance:
 
-## What's verified vs. not
+```bash
+RUN_PG_INTEGRATION_TESTS=1 DATABASE_URL=postgresql+asyncpg://myai:myai@localhost:5432/myai pytest tests/integration/test_rag.py
+```
 
-This was built in a sandbox with no network access — no `npm install`, no
-dev server, no browser. What I could and did verify:
-
-- **A real, strict TypeScript check** (`tsc --strict`) against actual
-  React 19 types available locally in the sandbox — not just "it parses."
-  Where the sandbox lacked official `@types/react`/`react-router-dom`
-  type declarations, I wrote a minimal shim and iteratively tightened it
-  (proper `createContext`/`useContext` generics, `useRef` nullability, JSX
-  `key` handling, DOM event handler types) until the only remaining
-  errors were genuine "module not found" for packages that aren't
-  installed — never silenced or ignored, each one individually resolved
-  or confirmed as expected.
-- All config files (`package.json`, `tsconfig*.json`, `vite.config.ts`,
-  `tailwind.config.ts`, `postcss.config.js`) for valid JSON/syntax.
-
-What still needs a real environment: `npm install` (pulls in Vite,
-Tailwind, React Router, `@types/*` — none of which exist in this sandbox),
-`npm run dev`, and an actual browser to confirm rendering, streaming, and
-Tailwind's generated output all behave as expected together. Claude Code
-(with network access) is the natural next step for that install → run →
-fix loop.
+Coverage: registration/login/JWT auth, API-key auth/revocation, project
+isolation (IDOR), the model router's routing decisions, the HF provider's
+response normalization (mocked), the chat endpoint (incl. streaming and
+provider-failure paths), conversation persistence, agent create/run,
+and rate limiting.
 
 ## Project layout
 
 ```
-src/
-  lib/          api client, SSE stream reader, auth + toast contexts
-  components/
-    ui/         Button, Badge, Modal, Input, ShimmerText
-    layout/     Sidebar, AppShell, AuthLayout
-    chat/       MessageBubble, RoutingTrace, Composer, ConversationList
-  pages/        one per route: chat, agents, knowledge, keys, projects, auth
-  types.ts      mirrors the backend's Pydantic schemas
+app/
+  core/          settings, security (password/JWT/API-key), logging, exceptions
+  db/            SQLAlchemy models, session, seed
+  schemas/       Pydantic request/response models
+  providers/     LLMProvider interface + Hugging Face implementation
+  models/        Model Registry + Model Router (business logic, not ORM)
+  orchestrator/  Context Builder, Execution Engine, Orchestrator
+  rag/           document loader, chunker, embeddings, retriever
+  services/      auth, project, api_key, conversation, agent, usage, rate_limit, audit
+  middleware/    request ID + access log, rate limiting, security headers
+  api/routes/    FastAPI routers
+migrations/      Alembic (async)
+tests/           unit / integration / security
 ```
 
-Routing is `react-router-dom` (`src/App.tsx`): `/login` and `/register` are
-public; everything else nests under `AppShell`, which redirects to
-`/login` if there's no valid token and provides the active project via
-`useOutletContext` (`src/lib/context.ts`).
+## Known gaps for the next iteration
+
+- API key `scopes` are stored and returned but not yet enforced per-endpoint
+  (currently authorization is project-level only, as the spec asks for in
+  V1: "do not build complex enterprise RBAC yet").
+- Document processing runs via FastAPI `BackgroundTasks`, not a queue - fine
+  for V1 per the spec, but move to Celery if upload volume grows.
+- Audit logging covers project creation and API key lifecycle; extend
+  `AuditService` calls to more mutations as needed.
+- The initial migration was hand-written and needs to be checked against a
+  real Postgres instance (see "Important" above).
+  ||||||| empty tree
+  =======
+
+# Ziloo-AI
+
+> > > > > > > 6029a5c081d3ee10e2456495a944185458aaa153
